@@ -4,7 +4,7 @@ LDFLAGS = -pthread
 
 all: build/stub
 
-build/stub: src/stub.c | build
+build/stub: src/mr.c | build
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 build:
