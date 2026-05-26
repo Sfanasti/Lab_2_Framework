@@ -1,5 +1,8 @@
 #define _POSIX_C_SOURCE 202405L
 
+#define MR_MAX_TOKEN_L 4096
+#define MR_MAX_VALUE_L (16u << 20)
+
 #define CHECK(cond, err)       \
     do {                       \
         if (!(cond)) {         \
@@ -18,7 +21,7 @@
 #include <dirent.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-
+#include <unistd.h>
 
 /* ================================================================== */
 /*                          Strutture Dati                            */
@@ -46,6 +49,11 @@ typedef struct {
     size_t value_size;
     size_t order;
 }pair_t;
+
+typedef struct{
+    int tok_len;
+    int val_len;
+}pair_header_t;
 
 /*collettore passato al mapper come emit_arg*/
 
@@ -89,7 +97,6 @@ int mr_attr_set_mapper_threads(mr_attr_t *attr, size_t n){
     attr -> mapper_threads = n;
     return 0;
 }
-
 int mr_attr_set_reducer_threads(mr_attr_t *attr, size_t n){
     CHECK(attr && n, EINVAL);
     attr -> reducer_threads = n;
@@ -195,7 +202,7 @@ static int collect_pair(const char *token, const void *value,
 
         if (vcopy == NULL){
             free(tokcopy);
-            c->error = 1;
+            c -> error = 1;
             return -1;
         }
 
@@ -443,4 +450,135 @@ int mr_start(mr_t mr, const char *input_path, const char *output_path) {
     collector_free(&coll);
     return rcode;
 
+}
+
+/* ================================================================== */
+/*                         Protocollo Interno                         */
+/* ================================================================== */
+
+/*
+  Legge esattamente n byte, oppure si ferma a EOF.
+  Ritorna: n in caso di successo;
+           k in [0, n) se EOF arriva dopo k byte (k=0 = EOF "pulito");
+           -1 in caso di errore (errno impostato).
+ */
+
+static ssize_t read_n(int fd, void *buf, size_t n){
+    size_t got = 0;
+    char *p = buf;
+
+    while (got < n){
+        ssize_t r = read(fd, p + got, n - got);
+        if (r < 0){                         //la syscall ha fallito
+            if (errno == EINTR) continue;   //era solo un segnale: riprova, non è un errore
+            return -1;                      //errore vero: propaga
+        }
+        if (r == 0) break; //EOF raggiunto
+        got += (size_t)r;
+    }
+
+    return (ssize_t)got;
+}
+
+/*
+  Scrive esattamente n byte. Non esiste un "EOF" in scrittura: un write che
+  ritorna 0 è anomalo e lo trattiamo come errore (EIO).
+ */
+
+static ssize_t write_n(int fd, const void *buf, size_t n){
+    size_t sent = 0;
+    const char *p = buf;
+
+    while (sent < n){
+        ssize_t w = write(fd, p + sent, n - sent);
+        if (w < 0){                         
+            if (errno == EINTR) continue;   
+            return -1;                      
+        }
+        CHECK (w !=0, EIO);
+        sent += (size_t)w;
+    }
+
+    return (ssize_t)n;
+}
+
+
+/* Serializza una coppia sulla pipe */
+
+static int pair_w(int fd, const char *token, const void *value, 
+                  size_t value_size){
+    CHECK(token, EINVAL);
+    
+    size_t tlen = strlen(token);
+    CHECK(tlen > 0 && tlen <= MR_MAX_TOKEN_L, EINVAL);
+    CHECK(value_size <= MR_MAX_VALUE_L, EINVAL);
+    
+    pair_header_t h;
+    h.tok_len = (int)tlen;
+    h.val_len = (int)value_size;
+
+    if (write_n(fd, &h, sizeof(h)) < 0) return -1;
+    if (write_n(fd, token, tlen) < 0) return -1;
+    if (value_size > 0 && write_n(fd, value, value_size) < 0) return -1;
+    return 0;
+}
+
+/* Riceve e deserializza una coppia */
+
+/*
+ * *token_out  : C-string allocata con malloc (token_len+1, terminata da '\0').
+ * *value_out  : buffer opaco allocato con malloc; NULL se value_size == 0.
+ * *value_size_out: numero di byte del valore.
+ *
+ * Ritorna  1 se ha letto una coppia completa,
+ *          0 se EOF pulito (nessun header iniziato),
+ *         -1 in caso di errore (errno impostato; nessuna memoria da liberare
+ *            per il chiamante).
+ */
+
+static int pair_r(int fd, char **token_out, void **value_out,
+                  size_t *value_size_out){
+    pair_header_t h;
+    ssize_t r = read_n(fd, &h, sizeof(h));
+
+    if (r == 0) return 0; //EOF pulito
+    if (r == -1) return -1;           /* errore di I/O: errno gia' impostato da read_n */
+    CHECK(r == (ssize_t)sizeof(h), EPROTO);   /* arrivati qui, e' troncato */
+    
+    CHECK(h.tok_len > 0 && h.tok_len <= MR_MAX_TOKEN_L &&
+          h.val_len >= 0 && h.val_len <= (int)MR_MAX_VALUE_L, EPROTO);
+    
+    size_t tlen = (size_t)h.tok_len;
+    size_t vlen = (size_t)h.val_len;
+
+    char *tok = malloc(tlen + 1);
+    if (tok == NULL) return -1;
+
+    void *val = NULL;
+    if (vlen > 0){
+        val = malloc(vlen);
+        if(val == NULL){
+            free(tok);
+            return -1;
+        }
+    }
+
+    if (read_n(fd, tok, tlen) != (ssize_t)tlen){
+        int e = errno ? errno : EPROTO;
+        free(tok);
+        free(val);
+        errno = e;
+        return -1;
+    }
+
+     if (vlen > 0 && read_n(fd, val, vlen) != (ssize_t)vlen) {
+        int e = errno ? errno : EPROTO;
+        free(tok); free(val); errno = e;
+        return -1;
+    }
+
+    *token_out = tok;
+    *value_out = val;
+    *value_size_out = vlen;
+    return 1;
 }
