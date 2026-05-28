@@ -3,6 +3,9 @@
 #define MR_MAX_TOKEN_L 4096
 #define MR_MAX_VALUE_L (16u << 20)
 
+#define MR_MAX_FNAME_L 4096
+#define MR_MAX_LINE_L (16u << 20)
+
 #define CHECK(cond, err)       \
     do {                       \
         if (!(cond)) {         \
@@ -22,6 +25,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 /* ================================================================== */
 /*                          Strutture Dati                            */
@@ -55,6 +59,11 @@ typedef struct{
     int val_len;
 }pair_header_t;
 
+typedef struct {
+    int           file_name_len;
+    int           line_len;
+    unsigned long line_number;
+}line_header_t;
 /*collettore passato al mapper come emit_arg*/
 
 typedef struct{
@@ -72,6 +81,21 @@ typedef struct{
     size_t results;
     int error;
 }writer_t;
+
+/*contesto passato come emit_arg quando l'emit scrive su una pipe*/
+typedef struct{
+    int fd;
+    int error;
+}pipe_emit_t;
+
+/* ================================================================== */
+/*               Forward declarations protocollo                      */
+/* ================================================================== */
+
+static int pair_w(int fd, const char *token, const void *value, size_t value_size);
+static int pair_r(int fd, char **token_out, void **value_out, size_t *value_size_out);
+static int line_w(int fd, const mr_file_line_t *fl);
+static int line_r(int fd, mr_file_line_t *fl_out, char **fname_out, char **line_out);
 
 /* ================================================================== */
 /*                         Gestione attributi                         */
@@ -164,59 +188,22 @@ int mr_destroy (mr_t mr){
 /*                                 Emit                               */
 /* ================================================================== */
 
-static int collect_pair(const char *token, const void *value,
-                          size_t value_size, void *emit_arg){
-    collector_t *c = emit_arg;
-
-    if (c -> error) return -1;
+/*emit usata sia dal mapper (token,value) sia dal reducer (token,result):
+  la serializzazione e' la stessa (pair_w).*/
+static int emit_to_pipe(const char *token, const void *data,
+                        size_t size, void *emit_arg){
+    pipe_emit_t *e = emit_arg;
+    if (e -> error) return -1;
     if (token == NULL){
-        c -> error = 1;
+        e -> error = 1;
         errno = EINVAL;
         return -1;
     }
-
-    //aumento dimensione array se necessario
-    if (c -> count == c-> max){
-        size_t newmax = c -> max ? c -> max * 2 : 16;
-        pair_t *tmp = realloc (c ->  items, newmax * sizeof (*tmp));
-
-        if (tmp == NULL){
-            c -> error = 1;
-            return -1;
-        }
-        c -> items = tmp;
-        c -> max = newmax;
-    }
-
-    size_t toklen = strlen(token);
-    char *tokcopy = malloc(toklen + 1);
-    if (tokcopy == NULL){
-        c -> error = 1;
+    if (pair_w(e -> fd, token, data, size) != 0){
+        e -> error = 1;
         return -1;
     }
-    memcpy(tokcopy, token, toklen + 1);
-
-    void *vcopy = NULL;
-    if (value_size > 0) {
-        vcopy = malloc(value_size);
-
-        if (vcopy == NULL){
-            free(tokcopy);
-            c -> error = 1;
-            return -1;
-        }
-
-        memcpy(vcopy, value, value_size); 
-    }
-
-    pair_t *p = &c -> items[c->count++];
-    p -> token = tokcopy;
-    p -> token_len = toklen;
-    p -> value = vcopy;
-    p -> value_size = value_size;
-    p -> order = c -> next_order++;
     return 0;
-
 }
 
 static int write_result(const char *token, const void *result,
@@ -250,12 +237,12 @@ static int write_result(const char *token, const void *result,
 /*                         Lettura dell'input                         */
 /* ================================================================== */
 
-static int process_file(mr_t mr, const char *path, collector_t *collector){
-    
+static int send_file_lines(const char *path, int fd){
+
     FILE *f = fopen(path, "rb");
     if (f == NULL) return -1;
 
-    char *buf =NULL;
+    char *buf = NULL;
     size_t max_l = 0;
     unsigned long lineno = 1;
     int rcode = 0;
@@ -264,24 +251,23 @@ static int process_file(mr_t mr, const char *path, collector_t *collector){
     while ((n = getline(&buf, &max_l, f)) != -1) {
         size_t len = (size_t)n;
         if (len > 0 && buf[len - 1] == '\n') len--;
-    
+
         mr_file_line_t fl;
         fl.file_name = path;
         fl.file_name_len = strlen(path);
         fl.line_number = lineno;
         fl.line = buf;
-        fl.line_len = len; 
+        fl.line_len = len;
 
-        if (mr -> mapper(&fl, collect_pair, collector, mr -> user_arg) != 0 ||
-            collector -> error) {
+        if (line_w(fd, &fl) != 0) {
             rcode = -1;
             break;
         }
         lineno++;
     }
- 
+
     if (rcode == 0 && ferror(f)) rcode = -1;
- 
+
     free(buf);
     fclose(f);
     return rcode;
@@ -294,28 +280,28 @@ static int cmp_str(const void *a, const void *b) {
 }
 
 
-static int process_directory(mr_t mr, const char *dirpath, collector_t *collector){
+static int send_dir_lines(const char *dirpath, int fd){
 
     DIR *d = opendir(dirpath);
     if (d == NULL) return -1;
- 
+
     char **names = NULL;
     size_t count = 0;
     size_t max_l = 0;
     int rcode = 0;
- 
+
     struct dirent *e;
     errno = 0;
 
     while ((e = readdir(d)) != NULL) {
         if (strcmp(e -> d_name, ".") == 0 || strcmp(e -> d_name, "..") == 0)
             continue;
- 
+
         size_t pathlen = strlen(dirpath) + 1 + strlen(e->d_name) + 1;
         char *full = malloc(pathlen);
         if (full == NULL) { rcode = -1; break; }
         snprintf(full, pathlen, "%s/%s", dirpath, e->d_name);
- 
+
         struct stat st;
         if (stat(full, &st) == 0 && S_ISREG(st.st_mode)) {
             if (count == max_l) {
@@ -335,14 +321,14 @@ static int process_directory(mr_t mr, const char *dirpath, collector_t *collecto
 
     if (rcode == 0 && errno != 0) rcode = -1; /* errore di readdir */
     closedir(d);
- 
+
     if (rcode == 0) {
         qsort(names, count, sizeof *names, cmp_str); /* ordine deterministico */
         for (size_t i = 0; i < count; i++) {
-            if (process_file(mr, names[i], collector) != 0) { rcode = -1; break; }
+            if (send_file_lines(names[i], fd) != 0) { rcode = -1; break; }
         }
     }
- 
+
     for (size_t i = 0; i < count; i++){
         free(names[i]);
     }
@@ -379,77 +365,233 @@ static void collector_free(collector_t *c) {
 }
 
 /* ================================================================== */
-/*                                Start                               */
+/*                              Figli                                 */
 /* ================================================================== */
 
-int mr_start(mr_t mr, const char *input_path, const char *output_path) {
-    CHECK(mr && input_path && output_path, EINVAL);
- 
-    struct stat st;
-    if (stat(input_path, &st) != 0) return -1;
- 
+/*Figlio mapper: legge righe da in_fd, chiama il mapper utente,
+  scrive coppie su out_fd. Esce con 0 a EOF pulito.*/
+static int mapper_child(mr_t mr, int in_fd, int out_fd){
+    pipe_emit_t emit_ctx;
+    emit_ctx.fd = out_fd; emit_ctx.error = 0;
+    int rcode = 0;
+
+    for (;;){
+        mr_file_line_t fl;
+        char *fname = NULL;
+        char *line = NULL;
+        int got = line_r(in_fd, &fl, &fname, &line);
+        if (got == 0) break;                 /* EOF pulito */
+        if (got == -1){ rcode = -1; break; }
+
+        if (mr -> mapper(&fl, emit_to_pipe, &emit_ctx, mr -> user_arg) != 0 ||
+            emit_ctx.error){
+            free(fname); free(line);
+            rcode = -1;
+            break;
+        }
+        free(fname);
+        free(line);
+    }
+    return rcode;
+}
+
+/*Figlio reducer: raccoglie tutte le coppie da in_fd, ordina, raggruppa,
+  chiama il reducer utente, scrive risultati su out_fd.*/
+static int reducer_child(mr_t mr, int in_fd, int out_fd){
     collector_t coll;
     memset(&coll, 0, sizeof coll);
- 
-    int rcode;
-    if (S_ISDIR(st.st_mode)) {
-        rcode = process_directory(mr, input_path, &coll);
-    } else if (S_ISREG(st.st_mode)) {
-        rcode = process_file(mr, input_path, &coll);
-    } else {
-        errno = EINVAL; /* ne' file regolare ne' directory */
-        rcode = -1;
+
+    /* fase A: raccolgo tutte le coppie dalla pipe */
+    for (;;){
+        char *tok = NULL;
+        void *val = NULL;
+        size_t vsize = 0;
+        int got = pair_r(in_fd, &tok, &val, &vsize);
+        if (got == 0) break;
+        if (got == -1){ collector_free(&coll); return -1; }
+
+        if (coll.count == coll.max){
+            size_t newmax = coll.max ? coll.max * 2 : 16;
+            pair_t *tmp = realloc(coll.items, newmax * sizeof(*tmp));
+            if (tmp == NULL){
+                free(tok); free(val); collector_free(&coll); return -1;
+            }
+            coll.items = tmp;
+            coll.max = newmax;
+        }
+        pair_t *p = &coll.items[coll.count++];
+        p -> token = tok;
+        p -> token_len = strlen(tok);
+        p -> value = val;
+        p -> value_size = vsize;
+        p -> order = coll.next_order++;
     }
-    if (rcode != 0) { collector_free(&coll); return -1; }
- 
-    /* 3) Ordinamento lessicografico per token (determinismo). */
+
+    /* fase B: ordino + raggruppo + chiamo reducer utente */
     qsort(coll.items, coll.count, sizeof *coll.items, cmp_pair);
- 
-    /* 4) Apertura output. */
-    FILE *f = fopen(output_path, "wb");
-    if (f == NULL) { collector_free(&coll); return -1; }
- 
-    writer_t w;
-    w.output = f; w.results = 0; w.error = 0;
- 
-    
-    rcode = 0;
+
+    pipe_emit_t emit_ctx;
+    emit_ctx.fd = out_fd; emit_ctx.error = 0;
+    int rcode = 0;
     size_t i = 0;
-    
-    while (i < coll.count) {
+
+    while (i < coll.count){
         size_t j = i;
         while (j < coll.count &&
                strcmp(coll.items[j].token, coll.items[i].token) == 0) j++;
-        
-        size_t group_n = j - i;
- 
-        mr_value_t *vals = malloc(group_n * sizeof *vals);
 
+        size_t group_n = j - i;
+
+        mr_value_t *vals = malloc(group_n * sizeof *vals);
         if (vals == NULL){
             rcode = -1;
             break;
         }
 
-        for (size_t k = 0; k < group_n; k++) {
+        for (size_t k = 0; k < group_n; k++){
             vals[k].data = coll.items[i + k].value;
             vals[k].size = coll.items[i + k].value_size;
         }
- 
+
         int r = mr -> reducer(coll.items[i].token, vals, group_n,
-                            write_result, &w, mr -> user_arg);
+                              emit_to_pipe, &emit_ctx, mr -> user_arg);
         free(vals);
-        if (r != 0 || w.error){
+        if (r != 0 || emit_ctx.error){
             rcode = -1;
             break;
         }
-
         i = j;
     }
- 
-    if (fclose(f) != 0) rcode = -1;
+
     collector_free(&coll);
     return rcode;
+}
 
+/* ================================================================== */
+/*                                Start                               */
+/* ================================================================== */
+
+int mr_start(mr_t mr, const char *input_path, const char *output_path) {
+    CHECK(mr && input_path && output_path, EINVAL);
+
+    struct stat st;
+    if (stat(input_path, &st) != 0) return -1;
+
+    /* 1) Apertura output. */
+    FILE *out = fopen(output_path, "wb");
+    if (out == NULL) return -1;
+
+    /* 2) Creazione delle 3 pipe.
+       pl = lines (padre -> mapper)
+       pp = pairs (mapper -> reducer)
+       pr = results (reducer -> padre) */
+    int pl[2], pp[2], pr[2];
+    if (pipe(pl) < 0){ fclose(out); return -1; }
+    if (pipe(pp) < 0){
+        close(pl[0]); close(pl[1]);
+        fclose(out); return -1;
+    }
+    if (pipe(pr) < 0){
+        close(pl[0]); close(pl[1]);
+        close(pp[0]); close(pp[1]);
+        fclose(out); return -1;
+    }
+
+    /* 3) Fork del mapper. */
+    pid_t pid_m = fork();
+    if (pid_m < 0){
+        close(pl[0]); close(pl[1]);
+        close(pp[0]); close(pp[1]);
+        close(pr[0]); close(pr[1]);
+        fclose(out); return -1;
+    }
+    if (pid_m == 0){
+        /* MAPPER CHILD: usa pl[0] (in), pp[1] (out) */
+        close(pl[1]); close(pp[0]);
+        close(pr[0]); close(pr[1]);
+        fclose(out);
+
+        if (dup2(pl[0], STDIN_FILENO)  < 0) _exit(1);
+        if (dup2(pp[1], STDOUT_FILENO) < 0) _exit(1);
+        close(pl[0]); close(pp[1]);
+
+        int rc = mapper_child(mr, STDIN_FILENO, STDOUT_FILENO);
+        _exit(rc == 0 ? 0 : 1);
+    }
+
+    /* 4) Fork del reducer. */
+    pid_t pid_r = fork();
+    if (pid_r < 0){
+        close(pl[0]); close(pl[1]);
+        close(pp[0]); close(pp[1]);
+        close(pr[0]); close(pr[1]);
+        fclose(out);
+        waitpid(pid_m, NULL, 0);
+        return -1;
+    }
+    if (pid_r == 0){
+        /* REDUCER CHILD: usa pp[0] (in), pr[1] (out) */
+        close(pl[0]); close(pl[1]);
+        close(pp[1]); close(pr[0]);
+        fclose(out);
+
+        if (dup2(pp[0], STDIN_FILENO)  < 0) _exit(1);
+        if (dup2(pr[1], STDOUT_FILENO) < 0) _exit(1);
+        close(pp[0]); close(pr[1]);
+
+        int rc = reducer_child(mr, STDIN_FILENO, STDOUT_FILENO);
+        _exit(rc == 0 ? 0 : 1);
+    }
+
+    /* 5) PARENT: chiude tutti gli fd che non gli servono. */
+    close(pl[0]);
+    close(pp[0]); close(pp[1]);
+    close(pr[1]);
+
+    int rcode = 0;
+
+    /* 6) Invio le righe al mapper. */
+    if (S_ISDIR(st.st_mode)) {
+        rcode = send_dir_lines(input_path, pl[1]);
+    } else if (S_ISREG(st.st_mode)) {
+        rcode = send_file_lines(input_path, pl[1]);
+    } else {
+        errno = EINVAL;
+        rcode = -1;
+    }
+
+    /* 7) Chiudo pl[1]: segnala EOF al mapper, a cascata al reducer. */
+    close(pl[1]);
+
+    /* 8) Leggo i risultati dal reducer e scrivo il .mro. */
+    writer_t w;
+    w.output = out; w.results = 0; w.error = 0;
+
+    if (rcode == 0){
+        for (;;){
+            char *tok = NULL;
+            void *res = NULL;
+            size_t rsize = 0;
+            int got = pair_r(pr[0], &tok, &res, &rsize);
+            if (got == 0) break;
+            if (got == -1){ rcode = -1; break; }
+
+            int wr = write_result(tok, res, rsize, &w);
+            free(tok); free(res);
+            if (wr != 0){ rcode = -1; break; }
+        }
+    }
+    close(pr[0]);
+
+    /* 9) Attendo i figli. */
+    int status;
+    if (waitpid(pid_m, &status, 0) < 0 ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0) rcode = -1;
+    if (waitpid(pid_r, &status, 0) < 0 ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0) rcode = -1;
+
+    if (fclose(out) != 0) rcode = -1;
+    return rcode;
 }
 
 /* ================================================================== */
@@ -570,6 +712,7 @@ static int pair_r(int fd, char **token_out, void **value_out,
         errno = e;
         return -1;
     }
+    tok[tlen] = '\0';
 
      if (vlen > 0 && read_n(fd, val, vlen) != (ssize_t)vlen) {
         int e = errno ? errno : EPROTO;
@@ -580,5 +723,68 @@ static int pair_r(int fd, char **token_out, void **value_out,
     *token_out = tok;
     *value_out = val;
     *value_size_out = vlen;
+    return 1;
+}
+
+/* Scrive una mr_file_line_t sulla pipe */
+static int line_w(int fd, const mr_file_line_t *fl){
+    CHECK(fl && fl -> file_name, EINVAL);
+    CHECK(fl -> file_name_len > 0 && fl->file_name_len <= MR_MAX_FNAME_L, EINVAL);
+    CHECK(fl -> line_len <= MR_MAX_LINE_L, EINVAL);
+
+    line_header_t h;
+    h.file_name_len = (int)fl->file_name_len;
+    h.line_len = (int)fl->line_len;
+    h.line_number = fl->line_number;
+
+    if (write_n(fd, &h, sizeof(h)) < 0) return -1;
+    if (write_n(fd, fl -> file_name, fl -> file_name_len) < 0) return -1;
+    if (fl -> line_len > 0 && write_n(fd, fl -> line, fl -> line_len) < 0) return -1;
+    return 0;
+}
+
+
+static int line_r(int fd, mr_file_line_t *fl_out,
+                  char **fname_out, char **line_out){
+    line_header_t h;
+    ssize_t r = read_n(fd, &h, sizeof(h));
+
+    if (r == 0)  return 0;
+    if (r == -1) return -1;
+    CHECK(r == (ssize_t)sizeof(h), EPROTO);
+    CHECK(h.file_name_len > 0 && h.file_name_len <= MR_MAX_FNAME_L &&
+          h.line_len >= 0 && h.line_len <= (int)MR_MAX_LINE_L, EPROTO);
+
+    size_t flen = (size_t)h.file_name_len;
+    size_t llen = (size_t)h.line_len;
+
+    char *fname = malloc(flen + 1);
+    if (fname == NULL) return -1;
+
+    char *line = NULL;
+    if (llen > 0){
+        line = malloc(llen);
+        if (line == NULL){ free(fname); return -1; }
+    }
+
+    if (read_n(fd, fname, flen) != (ssize_t)flen){
+        int e = errno ? errno : EPROTO;
+        free(fname); free(line); errno = e; return -1;
+    }
+
+    fname[flen] = '\0';
+
+    if (llen > 0 && read_n(fd, line, llen) != (ssize_t)llen){
+        int e = errno ? errno : EPROTO;
+        free(fname); free(line); errno = e; return -1;
+    }
+
+    fl_out -> file_name = fname;
+    fl_out -> file_name_len = flen;
+    fl_out -> line_number = h.line_number;
+    fl_out -> line = line;
+    fl_out -> line_len = llen;
+    *fname_out = fname;
+    *line_out  = line;
     return 1;
 }
